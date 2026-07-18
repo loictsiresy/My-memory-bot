@@ -540,4 +540,37 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Message not found or already deleted.")
     except ValueError:
-        await update.message.reply_text("❌ Please provide a valid
+                await update.message.reply_text("❌ Please provide a valid message ID.")
+
+# ============== MAIN ==============
+
+def main():
+    # Remplace 'TON_TOKEN_ICI' par la variable d'environnement ou le token réel
+    TOKEN = os.environ.get("BOT_TOKEN")
+    
+    if not TOKEN:
+        logger.error("BOT_TOKEN non trouvé dans les variables d'environnement")
+        return
+
+    application = Application.builder().token(TOKEN).build()
+
+    # Enregistrement des commandes
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("search", search_cmd))
+    application.add_handler(CommandHandler("last", last_cmd))
+    application.add_handler(CommandHandler("delete", delete_cmd))
+
+    # Gestion des messages et contenus
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    # Démarrage du scheduler et du bot
+    scheduler.start()
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
+    
