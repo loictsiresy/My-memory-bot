@@ -81,29 +81,39 @@ def get_memories(user_id, limit=15):
 
 # --- IA GROQ AVEC TEMPS RÉEL ---
 async def ask_groq(user_id, user_message):
+async def ask_groq(user_id, user_message):
     memories = get_memories(user_id, limit=12)
+    
+    # Configuration du fuseau horaire
     tz = pytz.timezone('Africa/Nairobi')
-    
-    # Récupération de la date et du nom du jour actuel
     now = datetime.now(tz)
-    date_str = now.strftime("%Y-%m-%d")
-    day_name = now.strftime("%A") # Ajout du nom du jour (Saturday, Sunday, etc.)
-    full_time_info = f"{date_str} ({day_name})"
     
-    # Instruction stricte ajoutée au system prompt
-    strict_instruction = f"""
-    CRITICAL: Today is {full_time_info}. 
-    ALWAYS use this date to determine the day of the week. 
-    If a user mentions a date, calculate the day of the week strictly from the provided calendar context.
-    Do not rely on your internal training data for calendar calculations.
-    """
+    # Calcul précis du jour et de la date
+    # %A donne le nom complet du jour (ex: Saturday)
+    # %d %B %Y donne la date complète (ex: 18 July 2026)
+    current_date_str = now.strftime("%A, %d %B %Y")
+    current_time_str = now.strftime("%H:%M:%S")
+    
+    # Instruction stricte injectée dans le contexte
+    # On précise à l'IA qu'elle doit se baser uniquement sur cette ligne
+    date_context = f"Today is {current_date_str}, {current_time_str} EAT."
     
     messages = [
-        {"role": "system", "content": f"{SYSTEM_PROMPT}\n{strict_instruction}"}
+        {"role": "system", "content": f"{SYSTEM_PROMPT}\nCALENDAR DATA: {date_context}\nCRITICAL: Use this date to resolve all weekday and calendar queries."}
     ]
+    
     for role, content in memories:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_message})
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={"model": "llama-3.1-8b-instant", "messages": messages, "temperature": 0.3, "max_tokens": 800}
+        )
+        data = response.json()
+        return data["choices"][0]["message"]["content"] if "choices" in data else "Error"
     
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
