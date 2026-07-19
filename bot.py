@@ -1,123 +1,96 @@
 import os
-import sqlite3
-import threading
+import re
 import pytz
 import httpx
 from datetime import datetime
-from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION ---
-DB_PATH = "memory.db"
-FILES_DIR = Path("files")
-FILES_DIR.mkdir(exist_ok=True)
-scheduler = AsyncIOScheduler()
-
-GROQ_KEY = os.environ.get("GROQ_API_KEY")
+# Assure-toi que BOT_TOKEN et GROQ_API_KEY sont définis dans tes variables d'environnement
+TOKEN = os.environ["BOT_TOKEN"]
+GROQ_KEY = os.environ["GROQ_API_KEY"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-SYSTEM_PROMPT = """You are a personal assistant that helps track packages, calculate dates, and set reminders.
-You have access to the exact current date and time in Antananarivo. 
-Always use this real-time information to calculate deadlines and reminders correctly."""
+# --- SYSTEM PROMPT ---
+SYSTEM_PROMPT = """Tu es un assistant personnel. 
+Ton rôle est de répondre aux demandes et de gérer des rappels.
+Si l'utilisateur demande un rappel, tu DOIS terminer ta réponse par ce format strict :
+[REMINDER:DD-MM-YYYY HH:MM|Description du rappel]
+Aujourd'hui est le {date_str}. Utilise cette date pour tes calculs."""
 
-# --- DATABASE ---
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, message_id INTEGER, type TEXT, content TEXT, timestamp TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, role TEXT, content TEXT, timestamp TEXT)''')
-    conn.commit()
-    conn.close()
+# --- INITIALISATION ---
+scheduler = AsyncIOScheduler()
+scheduler.start()
 
-init_db()
+# --- FONCTION DE RAPPEL ---
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Fonction appelée par le JobQueue pour envoyer le message de rappel."""
+    job = context.job
+    await context.bot.send_message(chat_id=job.chat_id, text=f"🔔 RAPPEL : {job.data}")
 
-def save_message(user_id, chat_id, message_id, msg_type, content):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO messages (user_id, chat_id, message_id, type, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
-              (user_id, chat_id, message_id, msg_type, content, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+# --- ANALYSE ET PLANIFICATION ---
+def parse_and_schedule(chat_id, ai_response, app):
+    """Analyse la réponse de l'IA pour extraire et programmer un rappel."""
+    match = re.search(r'\[REMINDER:(\d{2}-\d{2}-\d{4} \d{2}:\d{2})\|([^\]]+)\]', ai_response)
+    if match:
+        time_str, description = match.group(1), match.group(2)
+        try:
+            reminder_time = datetime.strptime(time_str, "%d-%m-%Y %H:%M").replace(tzinfo=pytz.UTC)
+            # Utilisation de la JobQueue intégrée à l'application
+            app.job_queue.run_once(send_reminder, when=reminder_time, chat_id=chat_id, data=description)
+            return True
+        except ValueError:
+            return False
+    return False
 
-def save_memory(user_id, role, content):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO memories (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)',
-              (user_id, role, content, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-def get_memories(user_id, limit=15):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT role, content FROM memories WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?', (user_id, limit))
-    results = c.fetchall()
-    conn.close()
-    return list(reversed(results))
-
-# --- IA GROQ (Correction de l'indentation) ---
-async def ask_groq(user_id, user_message):
-    memories = get_memories(user_id, limit=12)
-    
+# --- LOGIQUE IA (GROQ) ---
+async def ask_groq(user_message):
     tz = pytz.timezone('Africa/Nairobi')
-    now = datetime.now(tz)
-    date_context = f"Today is {now.strftime('%A, %d %B %Y')}, {now.strftime('%H:%M:%S %Z')}."
+    date_str = datetime.now(tz).strftime("%d-%m-%Y")
     
     messages = [
-        {"role": "system", "content": f"{SYSTEM_PROMPT}\nCALENDAR DATA: {date_context}\nCRITICAL: Use this date for all calculations. Do not guess."}
+        {"role": "system", "content": SYSTEM_PROMPT.format(date_str=date_str)},
+        {"role": "user", "content": user_message}
     ]
-    for role, content in memories:
-        messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_message})
     
-    # Tout le bloc ci-dessous DOIT être indenté sous ask_groq
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            GROQ_URL,
+            GROQ_URL, 
             headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.1-8b-instant", "messages": messages, "temperature": 0.3, "max_tokens": 800}
+            json={"model": "llama-3.1-8b-instant", "messages": messages, "temperature": 0.3}
         )
-        data = response.json()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"]
-        return "Error"
+        return response.json()["choices"][0]["message"]["content"]
 
 # --- HANDLERS ---
-async def start(update, context):
-    await update.message.reply_text("Bot actif.")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.caption or update.message.text
+    response = await ask_groq(text)
+    
+    # Tentative de programmation
+    if parse_and_schedule(update.effective_chat.id, response, context.application):
+        await update.message.reply_text(f"{response}\n\n✅ Rappel programmé.")
+    else:
+        await update.message.reply_text(response)
 
-async def handle_text(update, context):
-    user_id = update.effective_user.id
-    text = update.message.text
-    save_message(user_id, update.effective_chat.id, update.message.message_id, "text", text)
-    save_memory(user_id, "user", text)
-    response = await ask_groq(user_id, text)
-    save_memory(user_id, "assistant", response)
-    await update.message.reply_text(response)
+async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jobs = context.job_queue.jobs()
+    if not jobs:
+        await update.message.reply_text("Aucun rappel programmé.")
+        return
+    text = "📋 Rappels en cours :\n" + "\n".join([f"- {j.data}" for j in jobs])
+    await update.message.reply_text(text)
 
-# --- SERVEUR & MAIN ---
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-
+# --- MAIN ---
 def main():
-    token = os.environ["BOT_TOKEN"]
-    threading.Thread(target=run_web_server, daemon=True).start()
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("list", list_reminders))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
+    
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+    
