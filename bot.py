@@ -82,11 +82,25 @@ def get_memories(user_id, limit=15):
 # --- IA GROQ AVEC TEMPS RÉEL ---
 async def ask_groq(user_id, user_message):
     memories = get_memories(user_id, limit=12)
-    # Récupération du temps réel à Antananarivo
     tz = pytz.timezone('Africa/Nairobi')
-    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     
-    messages = [{"role": "system", "content": f"{SYSTEM_PROMPT}\nCurrent date and time in Antananarivo: {now}"}]
+    # Récupération de la date et du nom du jour actuel
+    now = datetime.now(tz)
+    date_str = now.strftime("%Y-%m-%d")
+    day_name = now.strftime("%A") # Ajout du nom du jour (Saturday, Sunday, etc.)
+    full_time_info = f"{date_str} ({day_name})"
+    
+    # Instruction stricte ajoutée au system prompt
+    strict_instruction = f"""
+    CRITICAL: Today is {full_time_info}. 
+    ALWAYS use this date to determine the day of the week. 
+    If a user mentions a date, calculate the day of the week strictly from the provided calendar context.
+    Do not rely on your internal training data for calendar calculations.
+    """
+    
+    messages = [
+        {"role": "system", "content": f"{SYSTEM_PROMPT}\n{strict_instruction}"}
+    ]
     for role, content in memories:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_message})
