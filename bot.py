@@ -81,7 +81,6 @@ def get_memories(user_id, limit=15):
 
 # --- IA GROQ AVEC TEMPS RÉEL ---
 async def ask_groq(user_id, user_message):
-async def ask_groq(user_id, user_message):
     memories = get_memories(user_id, limit=12)
     
     # Configuration du fuseau horaire
