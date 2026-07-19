@@ -1,20 +1,16 @@
 import os
 import sqlite3
 import threading
-import re
 import pytz
 import httpx
 from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
-    ContextTypes, filters
+    Application, CommandHandler, MessageHandler, filters
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.date import DateTrigger
 
 # --- CONFIGURATION ---
 DB_PATH = "memory.db"
@@ -53,15 +49,13 @@ init_db()
 def get_db():
     return sqlite3.connect(DB_PATH)
 
-def save_message(user_id, chat_id, message_id, msg_type, content, file_path=None, caption=None):
+def save_message(user_id, chat_id, message_id, msg_type, content):
     conn = get_db()
     c = conn.cursor()
-    c.execute('INSERT INTO messages (user_id, chat_id, message_id, type, content, file_path, caption, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        (user_id, chat_id, message_id, msg_type, content, file_path, caption, datetime.now().isoformat()))
+    c.execute('INSERT INTO messages (user_id, chat_id, message_id, type, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+        (user_id, chat_id, message_id, msg_type, content, datetime.now().isoformat()))
     conn.commit()
-    last_id = c.lastrowid
     conn.close()
-    return last_id
 
 def save_memory(user_id, role, content):
     conn = get_db()
@@ -83,24 +77,14 @@ def get_memories(user_id, limit=15):
 async def ask_groq(user_id, user_message):
     memories = get_memories(user_id, limit=12)
     
-    # Configuration du fuseau horaire
+    # Calcul précis du jour et de la date en Python
     tz = pytz.timezone('Africa/Nairobi')
     now = datetime.now(tz)
-    
-    # Calcul précis du jour et de la date
-    # %A donne le nom complet du jour (ex: Saturday)
-    # %d %B %Y donne la date complète (ex: 18 July 2026)
-    current_date_str = now.strftime("%A, %d %B %Y")
-    current_time_str = now.strftime("%H:%M:%S")
-    
-    # Instruction stricte injectée dans le contexte
-    # On précise à l'IA qu'elle doit se baser uniquement sur cette ligne
-    date_context = f"Today is {current_date_str}, {current_time_str} EAT."
+    date_context = f"Today is {now.strftime('%A, %d %B %Y')}, {now.strftime('%H:%M:%S %Z')}."
     
     messages = [
-        {"role": "system", "content": f"{SYSTEM_PROMPT}\nCALENDAR DATA: {date_context}\nCRITICAL: Use this date to resolve all weekday and calendar queries."}
+        {"role": "system", "content": f"{SYSTEM_PROMPT}\nCALENDAR DATA: {date_context}\nCRITICAL: Use this date for all calculations. Do not guess."}
     ]
-    
     for role, content in memories:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_message})
@@ -113,7 +97,44 @@ async def ask_groq(user_id, user_message):
         )
         data = response.json()
         return data["choices"][0]["message"]["content"] if "choices" in data else "Error"
+
+# --- HANDLERS ---
+async def start(update, context):
+    await update.message.reply_text("Bot actif et synchronisé avec le calendrier d'Antananarivo.")
+
+async def handle_text(update, context):
+    user_id = update.effective_user.id
+    text = update.message.text
+    save_message(user_id, update.effective_chat.id, update.message.message_id, "text", text)
+    save_memory(user_id, "user", text)
+    response = await ask_groq(user_id, text)
+    save_memory(user_id, "assistant", response)
+    await update.message.reply_text(response)
+
+# --- SERVEUR SANTÉ & MAIN ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+
+def main():
+    token = os.environ["BOT_TOKEN"]
+    threading.Thread(target=run_web_server, daemon=True).start()
     
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # drop_pending_updates=True résout le conflit Telegram
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             GROQ_URL,
